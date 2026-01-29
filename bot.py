@@ -5,15 +5,15 @@ from discord.ui import View, Select, Button
 import requests
 import json
 import io
-import os
 import datetime
+import os
 from user_utils import resolve_users_map
 
 # CONFIGURATION
-# GET TOKEN FROM ENVIRONMENT VARIABLE (Security Best Practice)
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 # Use localhost if running locally, or find a way to communicate if on cloud (usually localhost works if same container)
-API_URL = "http://127.0.0.1:5000" 
+# Dynamically get port from environment (Render uses random ports like 10000)
+API_URL = f"http://127.0.0.1:{os.environ.get('PORT', 5000)}"
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD" # Must match server.py
 CONFIG_FILE = "bot_config.json"
 
