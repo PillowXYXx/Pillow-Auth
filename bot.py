@@ -11,9 +11,13 @@ from user_utils import resolve_users_map
 
 # CONFIGURATION
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
-# Use localhost if running locally, or find a way to communicate if on cloud (usually localhost works if same container)
-# Dynamically get port from environment (Render uses random ports like 10000)
-API_URL = f"http://127.0.0.1:{os.environ.get('PORT', 5000)}"
+# Use Public URL for Cloud, Localhost for testing
+# If we find a "RENDER_EXTERNAL_URL" environment variable, we use that.
+if os.environ.get("RENDER"):
+    API_URL = "https://pillow-auth.onrender.com"
+else:
+    API_URL = "http://127.0.0.1:5000"
+
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD" # Must match server.py
 CONFIG_FILE = "bot_config.json"
 
