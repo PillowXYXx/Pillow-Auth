@@ -1,4 +1,5 @@
 import discord
+import asyncio
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Select, Button
@@ -7,10 +8,16 @@ import json
 import io
 import datetime
 import os
+import sqlite3
+import uuid
+import secrets
 from user_utils import resolve_users_map
 
 # CONFIGURATION
+# Token should be set in Environment Variables
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
+if not BOT_TOKEN:
+    print("⚠️ ERROR: DISCORD_TOKEN environment variable not set!")
 # Use Public URL for Cloud, Localhost for testing
 # If we find a "RENDER_EXTERNAL_URL" environment variable, we use that.
 if os.environ.get("RENDER"):
@@ -18,8 +25,12 @@ if os.environ.get("RENDER"):
 else:
     API_URL = "http://127.0.0.1:5000"
 
+# SERVER URL for new commands
+SERVER_URL = API_URL
+
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD" # Must match server.py
 CONFIG_FILE = "bot_config.json"
+DB_FILE = os.path.join(os.path.dirname(__file__), "keys.db")
 
 def load_config():
     try:
@@ -32,24 +43,517 @@ def save_config(config):
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=4)
 
+# --- OFFLINE DB FALLBACK HELPERS ---
+def db_query_fallback(endpoint, payload):
+    """
+    Attempts to call the API endpoint. 
+    If it fails (ConnectionError), falls back to direct SQLite access.
+    Returns a tuple: (status_code, json_response)
+    """
+    url = f"{API_URL}{endpoint}"
+    try:
+        response = requests.post(url, json=payload, timeout=2)
+        return response.status_code, response.json()
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        print(f"⚠️ API unreachable ({endpoint}). Switching to Offline DB Mode.")
+        return execute_offline_db(endpoint, payload)
+    except Exception as e:
+        return 500, {"error": f"Request Failed: {e}"}
+
+def execute_offline_db(endpoint, payload):
+    """Executes the equivalent SQL logic for supported endpoints."""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        response = {}
+        status = 200
+
+        # --- KEY GENERATION ---
+        if endpoint == "/generate":
+            amount = payload.get('amount', 1)
+            duration_hours = payload.get('duration_hours', 0)
+            note = payload.get('note')
+            discord_id = payload.get('discord_id') # Optional, for direct grant
+            
+            new_keys = []
+            for _ in range(amount):
+                key = "KEY-" + secrets.token_hex(16).upper()
+                created_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                expires_at = None
+                
+                # We store duration, but expires_at is calculated on redemption usually. 
+                # However, the server logic might be different. 
+                # Checking server.py (from memory/previous context), expires_at is NULL until redemption if duration > 0.
+                # If it's a fixed date expiration, it would be set here. 
+                # But 'duration_hours' implies it starts on use.
+                
+                c.execute("INSERT INTO licenses (key_code, status, duration_hours, created_at, note, discord_id) VALUES (?, ?, ?, ?, ?, ?)",
+                          (key, 'unused', duration_hours, created_at, note, discord_id))
+                new_keys.append(key)
+            
+            conn.commit()
+            response = {"keys": new_keys, "count": len(new_keys)}
+
+        # --- LIST KEYS ---
+        elif endpoint == "/list":
+            c.execute("SELECT * FROM licenses ORDER BY created_at DESC")
+            rows = c.fetchall()
+            keys = []
+            for row in rows:
+                k = dict(row)
+                # Check ban status from blacklist
+                is_banned = False
+                if k['hwid']:
+                    c_bl = conn.cursor()
+                    c_bl.execute("SELECT 1 FROM blacklist WHERE hwid=?", (k['hwid'],))
+                    if c_bl.fetchone(): is_banned = True
+                k['is_banned'] = is_banned
+                keys.append(k)
+            response = {"keys": keys}
+
+        # --- GET USER KEYS ---
+        elif endpoint == "/get_user_keys":
+            discord_id = payload.get('discord_id')
+            c.execute("SELECT * FROM licenses WHERE discord_id=?", (discord_id,))
+            rows = c.fetchall()
+            keys = []
+            for row in rows:
+                k = dict(row)
+                is_banned = False
+                if k['hwid']:
+                    c_bl = conn.cursor()
+                    c_bl.execute("SELECT 1 FROM blacklist WHERE hwid=?", (k['hwid'],))
+                    if c_bl.fetchone(): is_banned = True
+                k['is_banned'] = is_banned
+                keys.append(k)
+            response = {"keys": keys}
+
+        # --- PCREDIT BALANCE ---
+        elif endpoint == "/pcredit/balance":
+            discord_id = payload.get('discord_id')
+            c.execute("SELECT balance FROM user_credits WHERE discord_id=?", (discord_id,))
+            row = c.fetchone()
+            balance = row[0] if row else 0
+            response = {"discord_id": discord_id, "balance": balance}
+
+        # --- PCREDIT MANAGE ---
+        elif endpoint == "/pcredit/manage":
+            action = payload.get('action')
+            discord_id = payload.get('discord_id')
+            amount = payload.get('amount')
+            
+            c.execute("INSERT OR IGNORE INTO user_credits (discord_id, balance) VALUES (?, 0)", (discord_id,))
+            msg = ""
+            new_balance = 0
+            
+            if action == 'add':
+                c.execute("UPDATE user_credits SET balance = balance + ?, last_updated = CURRENT_TIMESTAMP WHERE discord_id=?", (amount, discord_id))
+                msg = f"Added {amount} credits (Offline Mode)"
+            elif action == 'remove':
+                c.execute("UPDATE user_credits SET balance = MAX(0, balance - ?), last_updated = CURRENT_TIMESTAMP WHERE discord_id=?", (amount, discord_id))
+                msg = f"Removed {amount} credits (Offline Mode)"
+            elif action == 'set':
+                c.execute("UPDATE user_credits SET balance = ?, last_updated = CURRENT_TIMESTAMP WHERE discord_id=?", (amount, discord_id))
+                msg = f"Set credits (Offline Mode)"
+            
+            conn.commit()
+            c.execute("SELECT balance FROM user_credits WHERE discord_id=?", (discord_id,))
+            new_balance = c.fetchone()[0]
+            response = {"success": True, "message": msg, "new_balance": new_balance}
+            
+        # --- LINK DISCORD (CLAIM) ---
+        elif endpoint == "/link_discord":
+            key = payload.get('key')
+            discord_id = payload.get('discord_id')
+            
+            c.execute("SELECT discord_id FROM licenses WHERE key_code=?", (key,))
+            row = c.fetchone()
+            if not row:
+                status = 404
+                response = {"error": "Invalid Key"}
+            else:
+                current_owner = row[0]
+                # Check existing key
+                c.execute("SELECT key_code FROM licenses WHERE discord_id=?", (discord_id,))
+                user_keys = c.fetchall()
+                has_other = False
+                for uk in user_keys:
+                    if uk[0] != key: has_other = True
+                
+                if has_other:
+                    status = 403
+                    response = {"error": "You can only claim ONE key per account."}
+                elif current_owner and current_owner != discord_id:
+                    status = 403
+                    response = {"error": "Key already claimed."}
+                else:
+                    c.execute("UPDATE licenses SET discord_id=? WHERE key_code=?", (discord_id, key))
+                    conn.commit()
+                    response = {"success": True, "message": "Key Linked (Offline Mode)"}
+
+        # --- BLACKLIST MANAGE ---
+        elif endpoint == "/blacklist/manage":
+            action = payload.get('action')
+            hwid = payload.get('hwid')
+            reason = payload.get('reason', 'No reason provided')
+            
+            if action == 'add':
+                if not hwid:
+                    status = 400
+                    response = {"error": "Missing HWID"}
+                else:
+                    c.execute("INSERT OR IGNORE INTO blacklist (hwid, reason) VALUES (?, ?)", (hwid, reason))
+                    conn.commit()
+                    response = {"success": True, "message": f"HWID {hwid} blacklisted."}
+            elif action == 'remove':
+                c.execute("DELETE FROM blacklist WHERE hwid=?", (hwid,))
+                conn.commit()
+                response = {"success": True, "message": f"HWID {hwid} removed from blacklist."}
+            elif action == 'list':
+                c.execute("SELECT * FROM blacklist")
+                rows = c.fetchall()
+                bl = [dict(r) for r in rows]
+                response = {"blacklist": bl}
+
+        # --- BAN KEY ---
+        elif endpoint == "/ban_key":
+            keys_to_ban = payload.get('keys', [])
+            reason = payload.get('reason', 'Banned')
+            for k in keys_to_ban:
+                c.execute("UPDATE licenses SET status='banned', note=note || ? WHERE key_code=?", (f" [BANNED: {reason}]", k))
+            conn.commit()
+            response = {"success": True, "message": f"Banned {len(keys_to_ban)} keys."}
+
+        # --- STATS ---
+        elif endpoint == "/stats":
+            c.execute("SELECT COUNT(*) FROM licenses")
+            total = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM licenses WHERE status='unused'")
+            unused = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM licenses WHERE status='active'")
+            active = c.fetchone()[0]
+            c.execute("SELECT COUNT(*) FROM licenses WHERE status='expired'")
+            expired = c.fetchone()[0]
+            
+            # Simple stats for offline mode
+            response = {
+                "total": total,
+                "unused": unused,
+                "used": total - unused,
+                "active": active,
+                "expired": expired,
+                "lifetime": 0, # Simplified
+                "limited": 0, # Simplified
+                "created_24h": 0, # Simplified
+                "recently_redeemed": [],
+                "recent_keys": []
+            }
+
+        # --- RESET BATCH ---
+        elif endpoint == "/reset_batch":
+            keys_to_reset = payload.get('keys', [])
+            for k in keys_to_reset:
+                c.execute("UPDATE licenses SET hwid=NULL, status='unused', device_name=NULL, ip_address=NULL, last_seen=NULL WHERE key_code=?", (k,))
+            conn.commit()
+            response = {"success": True, "message": f"Reset {len(keys_to_reset)} keys."}
+
+        # --- RECOVER KEY ---
+        elif endpoint == "/recover_key":
+            keys_to_recover = payload.get('keys', [])
+            for k in keys_to_recover:
+                # Set status to unused. Optionally we could try to clean up the note, but that's complex in SQL.
+                c.execute("UPDATE licenses SET status='unused' WHERE key_code=?", (k,))
+            conn.commit()
+            response = {"success": True, "message": f"Recovered {len(keys_to_recover)} keys."}
+
+        # --- DELETE BATCH ---
+        elif endpoint == "/delete_batch":
+            keys_to_delete = payload.get('keys', [])
+            for k in keys_to_delete:
+                c.execute("DELETE FROM licenses WHERE key_code=?", (k,))
+            conn.commit()
+            response = {"success": True, "message": f"Deleted {len(keys_to_delete)} keys."}
+
+        else:
+            status = 501
+            response = {"error": f"Endpoint {endpoint} not supported in Offline Mode"}
+
+        conn.close()
+        return status, response
+    except Exception as e:
+        return 500, {"error": f"Offline DB Error: {e}"}
+
 # Setup Bot
 class MyBot(commands.Bot):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        # IMPORTANT: You must enable "Server Members Intent" in the Discord Developer Portal
+        # for Invite Tracking to work. If the bot crashes, keep these commented out.
+        intents.members = True 
+        intents.invites = True
         super().__init__(command_prefix="!", intents=intents)
+        self.invite_cache = {}
 
     async def setup_hook(self):
         # Register persistent views here so buttons work after restart
         self.add_view(UserDashboardView())
+        self.add_view(PurchaseView())
+        self.add_view(TicketView())
+        self.add_view(RedeemSystemView())
         print("Bot setup complete. Run '!sync' in your server to enable slash commands.")
 
 bot = MyBot()
 
 @bot.event
 async def on_ready():
+    # Force sync on this version update to ensure commands are refreshed
+    if hasattr(bot, 'synced_commands_v3_fix_timeout'):
+        return
+    bot.synced_commands_v3_fix_timeout = True
+
     print(f'Logged in as {bot.user} (ID: {bot.user.id})')
     print('------')
+    print("!!! NEW VERSION LOADED - DEBUG MODE !!!")
+    print("⏳ Auto-syncing commands... (This might take a moment)")
+    
+    # Run sync in background to avoid blocking
+    bot.loop.create_task(background_sync())
+    
+    # Cache Invites
+    print("⏳ Caching invites for tracking...")
+    for guild in bot.guilds:
+        try:
+            bot.invite_cache[guild.id] = await guild.invites()
+            print(f"✅ Cached invites for: {guild.name}")
+        except Exception as e:
+            print(f"❌ Failed to cache invites for {guild.name}: {e}")
+
+async def background_sync():
+    print("⏳ Starting background sync...")
+    for guild in bot.guilds:
+        try:
+            bot.tree.copy_global_to(guild=guild)
+            synced = await bot.tree.sync(guild=guild)
+            print(f"✅ Synced {len(synced)} commands to: {guild.name}")
+        except Exception as e:
+            print(f"❌ Failed to sync to {guild.name}: {e}")
+    print("------ Sync Complete ------")
+
+@bot.event
+async def on_member_join(member):
+    config = load_config()
+    welcome_channel_id = config.get('welcome_channel_id')
+    
+    if welcome_channel_id:
+        channel = member.guild.get_channel(welcome_channel_id)
+        if channel:
+            embed = discord.Embed(
+                title=f"👋 Welcome to {member.guild.name}!",
+                description=f"Hello {member.mention}, welcome to the community! We're glad to have you here.",
+                color=discord.Color.teal()
+            )
+            embed.set_thumbnail(url=member.display_avatar.url)
+            embed.add_field(
+                name="🚀 **Getting Started**",
+                value="• Read the rules in the rules channel.\n• Check out `#purchase` to get a license.\n• Need help? Open a ticket!",
+                inline=False
+            )
+            embed.set_footer(text="Pillow Player • Automate your game")
+            
+            try:
+                await channel.send(content=f"Welcome {member.mention}!", embed=embed)
+            except Exception as e:
+                print(f"Failed to send welcome message: {e}")
+
+    # --- Invite Tracking ---
+    try:
+        inviter = None
+        old_invites = bot.invite_cache.get(member.guild.id, [])
+        new_invites = await member.guild.invites()
+        bot.invite_cache[member.guild.id] = new_invites
+        
+        for invite in new_invites:
+            # Find the invite that incremented in uses
+            for old_invite in old_invites:
+                if invite.code == old_invite.code and invite.uses > old_invite.uses:
+                    inviter = invite.inviter
+                    break
+            if inviter: break
+            
+        if inviter:
+            print(f"DEBUG: User {member.name} joined via invite from {inviter.name}")
+            
+            # ANTI-BOT CHECK: Do not reward if the inviter or the new member is a bot
+            if member.bot:
+                print(f"DEBUG: Member {member.name} is a bot. No invite reward.")
+                return
+            if inviter.bot:
+                print(f"DEBUG: Inviter {inviter.name} is a bot. No invite reward.")
+                return
+
+            # Add 1 Credit
+            payload = {
+                "admin_secret": ADMIN_SECRET,
+                "action": "add",
+                "discord_id": str(inviter.id),
+                "amount": 1
+            }
+            # Use fallback to ensure it works even if server is off
+            status, data = db_query_fallback("/pcredit/manage", payload)
+            
+            if status == 200:
+                new_bal = data.get("new_balance", "?")
+                # Log it
+                try:
+                    log_embed = discord.Embed(title="🤝 Invite Reward Claimed", color=discord.Color.green())
+                    log_embed.set_thumbnail(url=member.display_avatar.url)
+                    log_embed.add_field(name="📥 Inviter", value=f"{inviter.mention}\n`{inviter.name}`", inline=True)
+                    log_embed.add_field(name="👤 New Member", value=f"{member.mention}\n`{member.name}`", inline=True)
+                    log_embed.add_field(name="🎁 Reward", value="**+1 PCredit**", inline=True)
+                    log_embed.add_field(name="💰 New Balance", value=f"**{new_bal}** Credits", inline=False)
+                    log_embed.set_footer(text="Pillow Player Invite System", icon_url=inviter.display_avatar.url)
+                    log_embed.timestamp = datetime.datetime.now()
+                    await send_log_embed(member.guild, log_embed)
+                except: pass
+            else:
+                print(f"Failed to add credit for invite: {data}")
+                
+    except Exception as e:
+        print(f"Invite tracking error: {e}")
+
+@bot.tree.command(name="postrules", description="Post the official Server Rules (Admin Only)")
+async def postrules(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    # DEBUG: Print to console to verify command is hit
+    print("DEBUG: /postrules command received!")
+    
+    # DEFER IMMEDIATELY to prevent timeout
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    
+    embed = discord.Embed(
+        title="📜 **Server Rules**",
+        description="Please read and follow the rules below to ensure a safe and friendly community.",
+        color=discord.Color.red()
+    )
+    
+    embed.add_field(
+        name="🛡️ **1. General Behavior**",
+        value=(
+            "• Be respectful to all members and staff.\n"
+            "• No harassment, hate speech, or discrimination of any kind.\n"
+            "• Do not spam, flood, or post malicious links.\n"
+            "• Use English in the main channels."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💬 **2. Chat Etiquette**",
+        value=(
+            "• Keep conversations relevant to the channel topic.\n"
+            "• No excessive caps or formatting abuse.\n"
+            "• Do not ping staff members without a valid reason.\n"
+            "• No advertising or self-promotion without permission."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚠️ **3. Content Guidelines**",
+        value=(
+            "• No NSFW, gore, or illegal content.\n"
+            "• No doxxing or sharing personal information of others.\n"
+            "• Do not discuss or distribute cheats/exploits for other games."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚖️ **4. Marketplace Rules**",
+        value=(
+            "• All sales must go through the official ticket system.\n"
+            "• No scamming or attempting to defraud users.\n"
+            "• Chargebacks will result in an immediate ban."
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3208/3208726.png")
+    embed.set_footer(text="By staying in this server, you agree to these rules. Staff decisions are final.")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await interaction.followup.send(f"✅ Rules posted to {target_channel.mention}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}")
+
+@bot.tree.command(name="postpurchase", description="Post the Purchase Panel (Admin Only)")
+async def postpurchase(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    # DEBUG: Print to console to verify command is hit
+    print("DEBUG: /postpurchase command received!")
+    
+    # DEFER IMMEDIATELY to prevent timeout
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    
+    embed = discord.Embed(
+        title="💎 **Get Pillow Player Premium**",
+        description=(
+            "Unlock the full potential of your Roblox automation.\n"
+            "Purchase a license key instantly to get started!"
+        ),
+        color=discord.Color.gold()
+    )
+    
+    embed.add_field(
+        name="💰 **Pricing**",
+        value=(
+            "• **PayPal:** `$3.99 USD`\n"
+            "• **Robux:** `800 Robux`"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="✨ **What You Get**",
+        value=(
+            "✅ Unlimited Multi-Instance\n"
+            "✅ FPS Unlocker\n"
+            "✅ Account Manager\n"
+            "✅ Premium Support"
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Secure • Instant • Reliable")
+    
+    try:
+        await target_channel.send(embed=embed, view=PurchaseView())
+        await interaction.followup.send(f"✅ Purchase panel posted to {target_channel.mention}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}")
 
 @bot.tree.command(name="panel", description="Send the User Dashboard Panel (Admin Only)")
 async def panel(interaction: discord.Interaction, channel: discord.TextChannel = None):
@@ -74,6 +578,409 @@ async def panel(interaction: discord.Interaction, channel: discord.TextChannel =
     
     await target_channel.send(embed=embed, view=UserDashboardView())
     await interaction.response.send_message(f"✅ Dashboard sent to {target_channel.mention}", ephemeral=True)
+
+@bot.tree.command(name="postfeatures", description="Post the official Pillow Player features list v2 (Admin Only)")
+async def postfeatures(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    # DEBUG: Print to console to verify command is hit
+    print("DEBUG: /postfeatures command received!")
+    
+    # DEFER IMMEDIATELY to prevent timeout
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    
+    embed = discord.Embed(
+        title="🌟 **Pillow Player Features**",
+        description="The ultimate tool for Roblox multi-instance management and automation.",
+        color=discord.Color.purple()
+    )
+    
+    embed.add_field(
+        name="🚀 **Multi-Instance Manager**",
+        value="Run unlimited Roblox accounts simultaneously without conflicts. Our advanced mutex cleaner ensures smooth multi-client operation.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚡ **FPS Unlocker**",
+        value="Break the 60 FPS limit for smoother, high-performance gameplay on all your instances.",
+        inline=False
+    )
+    embed.add_field(
+        name="📂 **Account Manager**",
+        value="Securely save, load, and organize your Roblox accounts. Switch between accounts instantly.",
+        inline=False
+    )
+    embed.add_field(
+        name="🎮 **Auto-Launch**",
+        value="One-click launch into your favorite games. Setup launch profiles for different scenarios.",
+        inline=False
+    )
+    embed.add_field(
+        name="🖼️ **Window Management**",
+        value="Automatically rename and organize game windows for easy navigation.",
+        inline=False
+    )
+    embed.add_field(
+        name="🔒 **Secure Auth**",
+        value="Enterprise-grade license protection with HWID locking ensures your access is secure.",
+        inline=False
+    )
+    embed.add_field(
+        name="🤖 **Discord Integration**",
+        value="Control your session, check status, and manage licenses directly from this Discord server.",
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Pillow Player • Elevate Your Gameplay")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await interaction.followup.send(f"✅ Features list posted to {target_channel.mention}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}")
+
+@bot.tree.command(name="postguide", description="Post the official 'How to Use' guide v2 (Admin Only)")
+async def postguide(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    # DEBUG: Print to console to verify command is hit
+    print("DEBUG: /postguide command received!")
+    
+    # DEFER IMMEDIATELY to prevent timeout
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+    
+    embed = discord.Embed(
+        title="📚 **How to Use Pillow Player**",
+        description="Follow these steps to get started with the ultimate Roblox automation tool.",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="📥 **Step 1: Installation**",
+        value=(
+            "1. Download the latest version from our official channel.\n"
+            "2. **Extract** the `.zip` file to a folder (Do not run directly from the zip!).\n"
+            "3. Run **`Run_Pillow_Player.bat`** to start the application."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔑 **Step 2: Activation**",
+        value=(
+            "1. When you first open the tool, you will be asked for a **License Key**.\n"
+            "2. Use the `/claim` command in this server to link your key to your Discord account.\n"
+            "3. Enter your key in the Pillow Player application to unlock all features."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="👤 **Step 3: Adding Accounts**",
+        value=(
+            "1. Navigate to the **Account Manager** tab.\n"
+            "2. Click **Add Account**.\n"
+            "3. Enter your Roblox Cookie (Recommended) or Username/Password.\n"
+            "4. Your accounts are saved securely locally."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🚀 **Step 4: Launching Instances**",
+        value=(
+            "1. Select the accounts you wish to launch from the list.\n"
+            "2. Configure your **Launch Options** (e.g., Place ID, Auto-Join).\n"
+            "3. Click **Launch**.\n"
+            "4. The **Multi-Instance Manager** will automatically handle running multiple clients simultaneously."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛠️ **Troubleshooting Tips**",
+        value=(
+            "• **Admin Rights:** Always run as Administrator for full functionality.\n"
+            "• **Anti-Virus:** If the tool is blocked, add the folder to your AV exclusions.\n"
+            "• **Support:** If you encounter issues, please open a ticket in #support."
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Pillow Player • Easy & Secure")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await interaction.followup.send(f"✅ Guide posted to {target_channel.mention}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}")
+
+@bot.command()
+async def postfeatures(ctx, channel: discord.TextChannel = None):
+    """(Text Command) Post features list. Use this if slash command fails."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You do not have permission.")
+        return
+
+    target_channel = channel or ctx.channel
+    
+    embed = discord.Embed(
+        title="🌟 **Pillow Player Features**",
+        description="The ultimate tool for Roblox multi-instance management and automation.",
+        color=discord.Color.purple()
+    )
+    
+    embed.add_field(
+        name="🚀 **Multi-Instance Manager**",
+        value="Run unlimited Roblox accounts simultaneously without conflicts. Our advanced mutex cleaner ensures smooth multi-client operation.",
+        inline=False
+    )
+    embed.add_field(
+        name="⚡ **FPS Unlocker**",
+        value="Break the 60 FPS limit for smoother, high-performance gameplay on all your instances.",
+        inline=False
+    )
+    embed.add_field(
+        name="📂 **Account Manager**",
+        value="Securely save, load, and organize your Roblox accounts. Switch between accounts instantly.",
+        inline=False
+    )
+    embed.add_field(
+        name="🎮 **Auto-Launch**",
+        value="One-click launch into your favorite games. Setup launch profiles for different scenarios.",
+        inline=False
+    )
+    embed.add_field(
+        name="🖼️ **Window Management**",
+        value="Automatically rename and organize game windows for easy navigation.",
+        inline=False
+    )
+    embed.add_field(
+        name="🔒 **Secure Auth**",
+        value="Enterprise-grade license protection with HWID locking ensures your access is secure.",
+        inline=False
+    )
+    embed.add_field(
+        name="🤖 **Discord Integration**",
+        value="Control your session, check status, and manage licenses directly from this Discord server.",
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Pillow Player • Elevate Your Gameplay")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await ctx.send(f"✅ Features list posted to {target_channel.mention}")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to post: {e}")
+
+@bot.command()
+async def postguide(ctx, channel: discord.TextChannel = None):
+    """(Text Command) Post guide. Use this if slash command fails."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You do not have permission.")
+        return
+
+    target_channel = channel or ctx.channel
+    
+    embed = discord.Embed(
+        title="📚 **How to Use Pillow Player**",
+        description="Follow these steps to get started with the ultimate Roblox automation tool.",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(
+        name="📥 **Step 1: Installation**",
+        value=(
+            "1. Download the latest version from our official channel.\n"
+            "2. **Extract** the `.zip` file to a folder (Do not run directly from the zip!).\n"
+            "3. Run **`Run_Pillow_Player.bat`** to start the application."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔑 **Step 2: Activation**",
+        value=(
+            "1. When you first open the tool, you will be asked for a **License Key**.\n"
+            "2. Use the `/claim` command in this server to link your key to your Discord account.\n"
+            "3. Enter your key in the Pillow Player application to unlock all features."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="👤 **Step 3: Adding Accounts**",
+        value=(
+            "1. Navigate to the **Account Manager** tab.\n"
+            "2. Click **Add Account**.\n"
+            "3. Enter your Roblox Cookie (Recommended) or Username/Password.\n"
+            "4. Your accounts are saved securely locally."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🚀 **Step 4: Launching Instances**",
+        value=(
+            "1. Select the accounts you wish to launch from the list.\n"
+            "2. Configure your **Launch Options** (e.g., Place ID, Auto-Join).\n"
+            "3. Click **Launch**.\n"
+            "4. The **Multi-Instance Manager** will automatically handle running multiple clients simultaneously."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🛠️ **Troubleshooting Tips**",
+        value=(
+            "• **Admin Rights:** Always run as Administrator for full functionality.\n"
+            "• **Anti-Virus:** If the tool is blocked, add the folder to your AV exclusions.\n"
+            "• **Support:** If you encounter issues, please open a ticket in #support."
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Pillow Player • Easy & Secure")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await ctx.send(f"✅ Guide posted to {target_channel.mention}")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to post: {e}")
+
+@bot.command()
+async def postrules(ctx, channel: discord.TextChannel = None):
+    """(Text Command) Post server rules."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You do not have permission.")
+        return
+
+    target_channel = channel or ctx.channel
+    
+    embed = discord.Embed(
+        title="📜 **Server Rules**",
+        description="Please read and follow the rules below to ensure a safe and friendly community.",
+        color=discord.Color.red()
+    )
+    
+    embed.add_field(
+        name="🛡️ **1. General Behavior**",
+        value=(
+            "• Be respectful to all members and staff.\n"
+            "• No harassment, hate speech, or discrimination of any kind.\n"
+            "• Do not spam, flood, or post malicious links.\n"
+            "• Use English in the main channels."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💬 **2. Chat Etiquette**",
+        value=(
+            "• Keep conversations relevant to the channel topic.\n"
+            "• No excessive caps or formatting abuse.\n"
+            "• Do not ping staff members without a valid reason.\n"
+            "• No advertising or self-promotion without permission."
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="⚠️ **3. Content Guidelines**",
+        value=(
+            "• No NSFW, gore, or illegal content.\n"
+            "• No doxxing or sharing personal information of others.\n"
+            "• Do not discuss or distribute cheats/exploits for other games."
+        ),
+        inline=False
+    )
+
+    embed.add_field(
+        name="⚖️ **4. Marketplace Rules**",
+        value=(
+            "• All sales must go through the official ticket system.\n"
+            "• No scamming or attempting to defraud users.\n"
+            "• Chargebacks will result in an immediate ban."
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/3208/3208726.png")
+    embed.set_footer(text="By staying in this server, you agree to these rules. Staff decisions are final.")
+    
+    try:
+        await target_channel.send(embed=embed)
+        await ctx.send(f"✅ Rules posted to {target_channel.mention}")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to post: {e}")
+
+@bot.command()
+async def postpurchase(ctx, channel: discord.TextChannel = None):
+    """(Text Command) Post purchase panel."""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You do not have permission.")
+        return
+
+    target_channel = channel or ctx.channel
+    
+    embed = discord.Embed(
+        title="💎 **Get Pillow Player Premium**",
+        description=(
+            "Unlock the full potential of your Roblox automation.\n"
+            "Purchase a license key instantly to get started!"
+        ),
+        color=discord.Color.gold()
+    )
+    
+    embed.add_field(
+        name="💰 **Pricing**",
+        value=(
+            "• **PayPal:** `$3.99 USD`\n"
+            "• **Robux:** `800 Robux`"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="✨ **What You Get**",
+        value=(
+            "✅ Unlimited Multi-Instance\n"
+            "✅ FPS Unlocker\n"
+            "✅ Account Manager\n"
+            "✅ Premium Support"
+        ),
+        inline=False
+    )
+    
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/9322/9322127.png")
+    embed.set_footer(text="Secure • Instant • Reliable")
+    
+    try:
+        await target_channel.send(embed=embed, view=PurchaseView())
+        await ctx.send(f"✅ Purchase panel posted to {target_channel.mention}")
+    except Exception as e:
+        await ctx.send(f"❌ Failed to post: {e}")
 
 # --- UTILITY COMMANDS ---
 
@@ -106,6 +1013,90 @@ async def sync(ctx):
 
 # --- UI VIEWS ---
 
+class TicketView(View):
+    def __init__(self):
+        super().__init__(timeout=None) # Persistent view
+
+    @discord.ui.button(label="🔒 Close Ticket", style=discord.ButtonStyle.danger, custom_id="ticket_close")
+    async def close_button(self, interaction: discord.Interaction, button: Button):
+        await interaction.response.send_message("⚠️ Ticket will close in 5 seconds...", ephemeral=True)
+        await asyncio.sleep(5)
+        await interaction.channel.delete()
+
+class PurchaseView(View):
+    def __init__(self):
+        super().__init__(timeout=None) # Persistent view
+
+    @discord.ui.button(label="Pay with PayPal ($3.99)", style=discord.ButtonStyle.primary, custom_id="purchase_paypal")
+    async def paypal_button(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+        
+        # Sanitize channel name
+        channel_name = f"paypal-{interaction.user.name}".lower().replace(" ", "-")
+        
+        # Check if ticket already exists
+        existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing_channel:
+            await interaction.response.send_message(f"❌ You already have a ticket open: {existing_channel.mention}", ephemeral=True)
+            return
+
+        try:
+            channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites)
+            
+            embed = discord.Embed(title="💳 PayPal Payment Instructions", color=discord.Color.blue())
+            embed.description = (
+                "Please send **$3.99 USD** to our PayPal address:\n"
+                "📩 **pillowxyxx@gmail.com**\n\n"
+                "⚠️ **IMPORTANT:** Include your Discord Username in the payment note!\n"
+                "📸 **Proof:** Upload a screenshot of the payment here."
+            )
+            embed.set_footer(text="Support will review your payment shortly.")
+            
+            await channel.send(f"{interaction.user.mention}", embed=embed, view=TicketView())
+            await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to create ticket: {e}", ephemeral=True)
+
+    @discord.ui.button(label="Pay with Robux (800)", style=discord.ButtonStyle.success, custom_id="purchase_robux")
+    async def robux_button(self, interaction: discord.Interaction, button: Button):
+        guild = interaction.guild
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(read_messages=False),
+            interaction.user: discord.PermissionOverwrite(read_messages=True, send_messages=True),
+            guild.me: discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        }
+        
+        # Sanitize channel name
+        channel_name = f"robux-{interaction.user.name}".lower().replace(" ", "-")
+        
+        # Check if ticket already exists
+        existing_channel = discord.utils.get(guild.text_channels, name=channel_name)
+        if existing_channel:
+            await interaction.response.send_message(f"❌ You already have a ticket open: {existing_channel.mention}", ephemeral=True)
+            return
+
+        try:
+            channel = await guild.create_text_channel(name=channel_name, overwrites=overwrites)
+            
+            embed = discord.Embed(title="💎 Robux Payment Instructions", color=discord.Color.green())
+            embed.description = (
+                "Please purchase our Gamepass/T-Shirt for **800 Robux**:\n"
+                "🔗 **[INSERT ROBLOX GAMEPASS LINK HERE]**\n\n"
+                "⚠️ **IMPORTANT:** Roblox taxes are covered by you (if applicable).\n"
+                "📸 **Proof:** Upload a screenshot of the purchase transaction here."
+            )
+            embed.set_footer(text="Support will review your payment shortly.")
+            
+            await channel.send(f"{interaction.user.mention}", embed=embed, view=TicketView())
+            await interaction.response.send_message(f"✅ Ticket created: {channel.mention}", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Failed to create ticket: {e}", ephemeral=True)
+
 class ClaimKeyModal(discord.ui.Modal, title="Claim License Key"):
     key_input = discord.ui.TextInput(
         label="Enter your License Key",
@@ -123,12 +1114,14 @@ class ClaimKeyModal(discord.ui.Modal, title="Claim License Key"):
                 "key": self.key_input.value.strip(),
                 "discord_id": str(interaction.user.id)
             }
-            response = requests.post(f"{API_URL}/link_discord", json=payload)
+            status, data = db_query_fallback("/link_discord", payload)
             
-            if response.status_code == 200:
-                await interaction.followup.send(f"✅ Success! Key `{self.key_input.value}` is now linked to your Discord account.", ephemeral=True)
+            if status == 200:
+                # Use server message if available
+                msg = data.get('message', f"Key `{self.key_input.value}` is now linked to your Discord account.")
+                await interaction.followup.send(f"✅ {msg}", ephemeral=True)
             else:
-                error_msg = response.json().get('error', 'Unknown Error')
+                error_msg = data.get('error', 'Unknown Error')
                 await interaction.followup.send(f"❌ Failed: {error_msg}", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
@@ -149,10 +1142,10 @@ class UserDashboardView(View):
                 "admin_secret": ADMIN_SECRET,
                 "discord_id": str(interaction.user.id)
             }
-            response = requests.post(f"{API_URL}/get_user_keys", json=payload)
+            status, data = db_query_fallback("/get_user_keys", payload)
             
-            if response.status_code == 200:
-                keys = response.json().get("keys", [])
+            if status == 200:
+                keys = data.get("keys", [])
                 if not keys:
                     await interaction.followup.send("ℹ️ You don't have any keys linked to your account.", ephemeral=True)
                     return
@@ -261,42 +1254,42 @@ class KeyActionView(View):
     @discord.ui.button(label="Reset Selected", style=discord.ButtonStyle.primary, emoji="🔄")
     async def reset_button(self, interaction: discord.Interaction, button: Button):
         try:
-            response = requests.post(f"{API_URL}/reset_batch", json={"admin_secret": ADMIN_SECRET, "keys": self.keys})
-            if response.status_code == 200:
+            status, data = db_query_fallback("/reset_batch", {"admin_secret": ADMIN_SECRET, "keys": self.keys})
+            if status == 200:
                 count = len(self.keys)
                 await interaction.response.send_message(f"✅ {count} keys have been reset.", ephemeral=True)
                 # Refresh list
                 await self.main_view.refresh(interaction)
             else:
-                await interaction.response.send_message(f"❌ Error: {response.text}", ephemeral=True)
+                await interaction.response.send_message(f"❌ Error: {data.get('error', 'Unknown Error')}", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
 
     @discord.ui.button(label="Recover (Unban)", style=discord.ButtonStyle.success, emoji="🚑")
     async def recover_button(self, interaction: discord.Interaction, button: Button):
         try:
-            response = requests.post(f"{API_URL}/recover_key", json={"admin_secret": ADMIN_SECRET, "keys": self.keys})
-            if response.status_code == 200:
+            status, data = db_query_fallback("/recover_key", {"admin_secret": ADMIN_SECRET, "keys": self.keys})
+            if status == 200:
                 count = len(self.keys)
                 await interaction.response.send_message(f"✅ {count} keys have been recovered/unbanned.", ephemeral=True)
                 # Refresh list
                 await self.main_view.refresh(interaction)
             else:
-                await interaction.response.send_message(f"❌ Error: {response.text}", ephemeral=True)
+                await interaction.response.send_message(f"❌ Error: {data.get('error', 'Unknown Error')}", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
 
     @discord.ui.button(label="Delete Selected", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def delete_button(self, interaction: discord.Interaction, button: Button):
         try:
-            response = requests.post(f"{API_URL}/delete_batch", json={"admin_secret": ADMIN_SECRET, "keys": self.keys})
-            if response.status_code == 200:
+            status, data = db_query_fallback("/delete_batch", {"admin_secret": ADMIN_SECRET, "keys": self.keys})
+            if status == 200:
                 count = len(self.keys)
                 await interaction.response.send_message(f"🗑️ {count} keys deleted.", ephemeral=True)
                 # Refresh list
                 await self.main_view.refresh(interaction)
             else:
-                await interaction.response.send_message(f"❌ Error: {response.text}", ephemeral=True)
+                await interaction.response.send_message(f"❌ Error: {data.get('error', 'Unknown Error')}", ephemeral=True)
         except Exception as e:
             await interaction.response.send_message(f"❌ Failed: {e}", ephemeral=True)
 
@@ -333,6 +1326,8 @@ class KeyManagementView(View):
                 embed.add_field(name="Status", value=key_data['status'], inline=True)
                 embed.add_field(name="HWID", value=str(key_data.get('hwid', 'None')), inline=True)
                 embed.add_field(name="Device", value=str(key_data['device_name']), inline=True)
+                embed.add_field(name="IP Address", value=str(key_data.get('ip_address', 'Unknown')), inline=True)
+                embed.add_field(name="Last Seen", value=str(key_data.get('last_seen', 'Never')), inline=True)
                 
                 # Discord User
                 discord_id = key_data.get('discord_id')
@@ -365,9 +1360,9 @@ class KeyManagementView(View):
     async def refresh(self, interaction):
         # Re-fetch keys
         try:
-            response = requests.post(f"{API_URL}/list", json={"admin_secret": ADMIN_SECRET})
-            if response.status_code == 200:
-                new_keys = response.json().get("keys", [])
+            status, data = db_query_fallback("/list", {"admin_secret": ADMIN_SECRET})
+            if status == 200:
+                new_keys = data.get("keys", [])
                 new_user_map = await resolve_users_map(interaction, new_keys)
                 new_view = KeyManagementView(new_keys, new_user_map)
                 await interaction.message.edit(embed=new_view.main_embed, view=new_view)
@@ -375,6 +1370,109 @@ class KeyManagementView(View):
                 await interaction.followup.send("Failed to refresh list.", ephemeral=True)
         except:
              pass
+
+class RedeemSystemView(View):
+    def __init__(self):
+        super().__init__(timeout=None) # Persistent
+
+    @discord.ui.button(label="🛒 Buy License (20 Credits)", style=discord.ButtonStyle.success, emoji="🔑", custom_id="redeem_buy")
+    async def buy_button(self, interaction: discord.Interaction, button: Button):
+        # ANTI-BOT CHECK
+        if interaction.user.bot:
+            await interaction.response.send_message("❌ Bots cannot buy keys.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        COST = 20
+        
+        try:
+            # 1. Check Balance
+            payload = {
+                "admin_secret": ADMIN_SECRET,
+                "discord_id": str(interaction.user.id)
+            }
+            status, data = db_query_fallback("/pcredit/balance", payload)
+            if status != 200:
+                await interaction.followup.send(f"❌ Error checking balance: {data.get('error')}", ephemeral=True)
+                return
+                
+            balance = data.get("balance", 0)
+            
+            if balance < COST:
+                await interaction.followup.send(f"❌ You need **{COST}** credits to buy a license. You have **{balance}** credits.", ephemeral=True)
+                return
+                
+            # 2. Deduct Credits
+            payload_deduct = {
+                "admin_secret": ADMIN_SECRET,
+                "action": "remove",
+                "discord_id": str(interaction.user.id),
+                "amount": COST
+            }
+            status_d, data_d = db_query_fallback("/pcredit/manage", payload_deduct)
+            
+            if status_d != 200:
+                await interaction.followup.send(f"❌ Transaction failed: {data_d.get('error')}", ephemeral=True)
+                return
+                
+            new_balance = data_d.get("new_balance")
+            
+            # 3. Generate Key
+            payload_gen = {
+                "admin_secret": ADMIN_SECRET,
+                "amount": 1,
+                "duration_hours": 0, # Lifetime
+                "note": f"Purchased with {COST} PCredits by {interaction.user.name}",
+            }
+            
+            status_g, data_g = db_query_fallback("/generate", payload_gen)
+            
+            if status_g == 200:
+                keys = data_g.get("keys", [])
+                if keys:
+                    key = keys[0]
+                    
+                    # Log Purchase
+                    try:
+                        log_embed = discord.Embed(title="🛒 Key Purchased", color=discord.Color.teal())
+                        log_embed.add_field(name="👤 User", value=interaction.user.mention, inline=True)
+                        log_embed.add_field(name="💰 Cost", value=f"**{COST}** Credits", inline=True)
+                        log_embed.add_field(name="🔢 Remaining", value=f"**{new_balance}** Credits", inline=True)
+                        log_embed.add_field(name="🔑 Key", value=f"`{key}`", inline=False)
+                        log_embed.set_footer(text="Pillow Player Store", icon_url=interaction.user.display_avatar.url)
+                        log_embed.timestamp = datetime.datetime.now()
+                        await send_log_embed(interaction.guild, log_embed)
+                    except: pass
+
+                    # DM User
+                    try:
+                        embed = discord.Embed(title="🎉 Purchase Successful!", color=discord.Color.gold())
+                        embed.description = f"You have redeemed **{COST}** credits for a license."
+                        embed.add_field(name="Your License Key", value=f"```{key}```", inline=False)
+                        embed.add_field(name="Instructions", value="Use `/claim` in the server to activate this key.", inline=False)
+                        embed.set_footer(text="Thank you for your support!")
+                        await interaction.user.send(embed=embed)
+                        await interaction.followup.send(f"✅ **Purchase Successful!** Key sent to your DMs.\nNew Balance: **{new_balance}**", ephemeral=True)
+                    except discord.Forbidden:
+                        await interaction.followup.send(f"✅ **Purchase Successful!**\n\n**Key:** `{key}`\n\n⚠️ I couldn't DM you, so here it is. Save it immediately!\nNew Balance: **{new_balance}**", ephemeral=True)
+            else:
+                await interaction.followup.send(f"❌ Error generating key: {data_g.get('error')}", ephemeral=True)
+                
+        except Exception as e:
+            await interaction.followup.send(f"❌ System Error: {e}", ephemeral=True)
+
+    @discord.ui.button(label="❓ How it Works", style=discord.ButtonStyle.secondary, emoji="ℹ️", custom_id="redeem_help")
+    async def help_button(self, interaction: discord.Interaction, button: Button):
+        msg = (
+            "**💳 Pillow Player Credit System**\n\n"
+            "**How to earn credits:**\n"
+            "• **Invite Friends:** Get **1 Credit** for every person you invite who joins the server.\n\n"
+            "**Rewards:**\n"
+            "• **20 Credits** = **1 Lifetime License Key**\n\n"
+            "Click the **Buy License** button to redeem your credits instantly!"
+        )
+        await interaction.response.send_message(msg, ephemeral=True)
 
 # --- SLASH COMMANDS ---
 
@@ -386,11 +1484,18 @@ class KeyManagementView(View):
     app_commands.Choice(name="List", value="list")
 ])
 async def blacklist(interaction: discord.Interaction, action: app_commands.Choice[str], hwid: str = None, key: str = None, reason: str = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /blacklist command received")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer()
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission to use this command.", ephemeral=True)
+        return
 
     try:
         # Resolve HWID from Key if needed
@@ -400,9 +1505,9 @@ async def blacklist(interaction: discord.Interaction, action: app_commands.Choic
             if not target_hwid and key:
                 # Fetch key info to find HWID
                 try:
-                    res = requests.post(f"{API_URL}/list", json={"admin_secret": ADMIN_SECRET})
-                    if res.status_code == 200:
-                        all_keys = res.json().get("keys", [])
+                    status, data = db_query_fallback("/list", {"admin_secret": ADMIN_SECRET})
+                    if status == 200:
+                        all_keys = data.get("keys", [])
                         found_key = next((k for k in all_keys if k['key_code'] == key), None)
                         if found_key:
                             target_hwid = found_key.get('hwid')
@@ -426,11 +1531,9 @@ async def blacklist(interaction: discord.Interaction, action: app_commands.Choic
             "hwid": target_hwid,
             "reason": reason
         }
-        response = requests.post(f"{API_URL}/blacklist/manage", json=payload)
+        status, data = db_query_fallback("/blacklist/manage", payload)
         
-        if response.status_code == 200:
-            data = response.json()
-            
+        if status == 200:
             if action.value == 'list':
                 bl_list = data.get("blacklist", [])
                 if not bl_list:
@@ -449,19 +1552,185 @@ async def blacklist(interaction: discord.Interaction, action: app_commands.Choic
                 await send_log(interaction.guild, f"🛡️ Blacklist {action.name}", f"Admin: {interaction.user.mention}\nAction: `{action.value.upper()}`\nHWID: `{target_hwid}`\nReason: {reason}", discord.Color.orange())
 
         else:
-            await interaction.followup.send(f"❌ Server Error: {response.text}")
+            await interaction.followup.send(f"❌ Server Error: {data.get('error', 'Unknown Error')}")
 
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to connect to server: {e}")
 
+@bot.tree.command(name="infocheck", description="Check detailed info about a user (Admin Only)")
+@app_commands.describe(user="The user to check")
+async def infocheck(interaction: discord.Interaction, user: discord.User):
+    # DEBUG: Print to console
+    print(f"DEBUG: /infocheck command received for user {user.id}")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET,
+            "discord_id": str(user.id)
+        }
+        # Use fallback for offline support
+        status, data = db_query_fallback("/get_user_keys", payload)
+        
+        if status == 200:
+            keys = data.get("keys", [])
+            
+            if not keys:
+                await interaction.followup.send(f"ℹ️ User {user.mention} has no keys linked.")
+                return
+
+            embed = discord.Embed(
+                title=f"👤 User Info: {user.name}",
+                description=f"**User ID:** `{user.id}`\n**Total Keys:** {len(keys)}",
+                color=discord.Color.blue()
+            )
+            embed.set_thumbnail(url=user.display_avatar.url)
+
+            for i, k in enumerate(keys):
+                status_emoji = "🟢" if k['status'] == 'unused' else "🔴"
+                if k.get('is_banned'): status_emoji = "🚫"
+                
+                # Format Dates
+                created = k.get('created_at', 'Unknown')
+                expires = k.get('expires_at') or "Never"
+                redeemed = k.get('redeemed_at') or "Not Redeemed"
+                last_seen = k.get('last_seen') or "Never"
+                ip_addr = k.get('ip_address') or "Unknown"
+                
+                # Duration
+                dur = k.get('duration_hours', 0)
+                dur_str = "Lifetime" if dur == 0 else f"{dur} Hours"
+
+                details = (
+                        f"**Key:** `{k['key_code']}`\n\n"
+                        f"**Status:** {status_emoji} {k['status'].title()} | **Runs:** `{k.get('run_count', 0)}` | **Duration:** {dur_str}\n"
+                        f"────────────────\n"
+                        f"💻 **Device Info**\n"
+                        f"**HWID:** `{k.get('hwid') or 'None'}`\n"
+                        f"**Device:** `{k.get('device_name') or 'None'}`\n"
+                        f"**IP:** `{ip_addr}`\n"
+                        f"────────────────\n"
+                        f"🕒 **Timestamps**\n"
+                        f"**Last Execution Time:** {last_seen}\n"
+                        f"**Redeemed:** {redeemed}\n"
+                        f"**Expires:** {expires}\n"
+                        f"**Created:** {created}\n"
+
+                    )
+                if k.get('note'):
+                    details += f"\n📝 **Note:** {k['note']}\n"
+
+                embed.add_field(name=f"🔑 License #{i+1}", value=details, inline=False)
+                
+            embed.set_footer(text="Pillow Player Auth System • Admin Access")
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(f"❌ Error fetching data: {data.get('error', 'Unknown Error')}")
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed: {e}")
+
+@bot.command(name="infocheck", aliases=["checkuser", "userinfo"])
+async def infocheck_text(ctx, user: discord.User = None):
+    """Check detailed info about a user (Admin Only)"""
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ You do not have permission.")
+        return
+
+    if not user:
+        await ctx.send("Usage: !infocheck @User")
+        return
+
+    async with ctx.typing():
+        try:
+            payload = {
+                "admin_secret": ADMIN_SECRET,
+                "discord_id": str(user.id)
+            }
+            status, data = db_query_fallback("/get_user_keys", payload)
+            
+            if status == 200:
+                keys = data.get("keys", [])
+                
+                if not keys:
+                    await ctx.send(f"ℹ️ User {user.mention} has no keys linked.")
+                    return
+
+                embed = discord.Embed(
+                    title=f"👤 User Info: {user.name}",
+                    description=f"**User ID:** `{user.id}`\n**Total Keys:** {len(keys)}",
+                    color=discord.Color.blue()
+                )
+                embed.set_thumbnail(url=user.display_avatar.url)
+
+                for i, k in enumerate(keys):
+                    status_emoji = "🟢" if k['status'] == 'unused' else "🔴"
+                    if k.get('is_banned'): status_emoji = "🚫"
+                    
+                    # Format Dates
+                    created = k.get('created_at', 'Unknown')
+                    expires = k.get('expires_at') or "Never"
+                    redeemed = k.get('redeemed_at') or "Not Redeemed"
+                    last_seen = k.get('last_seen') or "Never"
+                    ip_addr = k.get('ip_address') or "Unknown"
+                    
+                    # Duration
+                    dur = k.get('duration_hours', 0)
+                    dur_str = "Lifetime" if dur == 0 else f"{dur} Hours"
+
+                    details = (
+                        f"**Key:** `{k['key_code']}`\n\n"
+                        f"**Status:** {status_emoji} {k['status'].title()} | **Runs:** `{k.get('run_count', 0)}` | **Duration:** {dur_str}\n"
+                        f"────────────────\n"
+                        f"💻 **Device Info**\n"
+                        f"**HWID:** `{k.get('hwid') or 'None'}`\n"
+                        f"**Device:** `{k.get('device_name') or 'None'}`\n"
+                        f"**IP:** `{ip_addr}`\n"
+                        f"────────────────\n"
+                        f"🕒 **Timestamps**\n"
+                        f"**Last Execution Time:** {last_seen}\n"
+                        f"**Redeemed:** {redeemed}\n"
+                        f"**Expires:** {expires}\n"
+                        f"**Created:** {created}\n"
+                    )
+                    if k.get('note'):
+                        details += f"\n📝 **Note:** {k['note']}\n"
+
+                    embed.add_field(name=f"🔑 License #{i+1}", value=details, inline=False)
+                
+                embed.set_footer(text="Pillow Player Auth System • Admin Access")
+                await ctx.send(embed=embed)
+            else:
+                await ctx.send(f"❌ Error fetching data: {data.get('error', 'Unknown Error')}")
+                
+        except Exception as e:
+            await ctx.send(f"❌ Failed: {e}")
+
+
 @bot.tree.command(name="grant", description="Generate and send a key to a specific user (Admin Only)")
 @app_commands.describe(user="The user to grant the key to", duration="Duration in hours (0 for lifetime)", note="Optional note")
 async def grant(interaction: discord.Interaction, user: discord.Member, duration: int = 0, note: str = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /grant command received for user {user.id}")
+
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
 
     try:
         payload = {
@@ -472,10 +1741,10 @@ async def grant(interaction: discord.Interaction, user: discord.Member, duration
             "discord_id": str(user.id)
         }
         
-        response = requests.post(f"{API_URL}/generate", json=payload)
+        status, data = db_query_fallback("/generate", payload)
         
-        if response.status_code == 200:
-            keys = response.json().get("keys", [])
+        if status == 200:
+            keys = data.get("keys", [])
             if keys:
                 key = keys[0]
                 # DM the user
@@ -512,7 +1781,7 @@ async def grant(interaction: discord.Interaction, user: discord.Member, duration
             else:
                 await interaction.followup.send("❌ Failed to generate key.")
         else:
-            await interaction.followup.send(f"❌ Server Error: {response.text}")
+            await interaction.followup.send(f"❌ Server Error: {data.get('error', 'Unknown Error')}")
             
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
@@ -520,17 +1789,24 @@ async def grant(interaction: discord.Interaction, user: discord.Member, duration
 @bot.tree.command(name="claim", description="Link your existing license key to your Discord account")
 @app_commands.describe(key="The license key to claim")
 async def claim(interaction: discord.Interaction, key: str):
-    await interaction.response.defer(ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /claim command received for key {key}")
     
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
     try:
         payload = {
             "admin_secret": ADMIN_SECRET,
             "key": key,
             "discord_id": str(interaction.user.id)
         }
-        response = requests.post(f"{API_URL}/link_discord", json=payload)
+        status, data = db_query_fallback("/link_discord", payload)
         
-        if response.status_code == 200:
+        if status == 200:
             msg = f"✅ Success! Key `{key}` is now linked to your Discord account."
             
             # Auto-assign Role
@@ -555,7 +1831,7 @@ async def claim(interaction: discord.Interaction, key: str):
             await send_log(interaction.guild, "🔗 Key Claimed", f"User: {interaction.user.mention} (`{interaction.user.id}`)\nKey: `{key}`", discord.Color.blue())
             
         else:
-            await interaction.followup.send(f"❌ Failed: {response.json().get('error', 'Unknown Error')}")
+            await interaction.followup.send(f"❌ Failed: {data.get('error', 'Unknown Error')}")
             
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}")
@@ -563,20 +1839,27 @@ async def claim(interaction: discord.Interaction, key: str):
 @bot.tree.command(name="banuser", description="Ban all keys linked to a Discord user (Admin Only)")
 @app_commands.describe(user="The user to ban", reason="Reason for ban")
 async def banuser(interaction: discord.Interaction, user: discord.Member, reason: str = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /banuser command received for user {user.id}")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer()
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
     
     try:
         # 1. Get all keys
-        res = requests.post(f"{API_URL}/list", json={"admin_secret": ADMIN_SECRET})
-        if res.status_code != 200:
+        status, data = db_query_fallback("/list", {"admin_secret": ADMIN_SECRET})
+        if status != 200:
             await interaction.followup.send("❌ Failed to fetch keys.")
             return
             
-        keys = res.json().get("keys", [])
+        keys = data.get("keys", [])
         target_id = str(user.id)
         
         # 2. Filter keys belonging to this user
@@ -602,7 +1885,7 @@ async def banuser(interaction: discord.Interaction, user: discord.Member, reason
                     "hwid": hwid,
                     "reason": f"Banned User {user.name} ({user.id}) - {reason or 'No reason'}"
                 }
-                requests.post(f"{API_URL}/blacklist/manage", json=bl_payload)
+                db_query_fallback("/blacklist/manage", bl_payload)
                 hwids_banned.add(hwid)
         
         # Call server to set status='banned' for all keys
@@ -612,7 +1895,7 @@ async def banuser(interaction: discord.Interaction, user: discord.Member, reason
                 "keys": keys_to_ban,
                 "reason": reason or "Banned via Discord Command"
             }
-            requests.post(f"{API_URL}/ban_key", json=ban_payload)
+            db_query_fallback("/ban_key", ban_payload)
             
         await interaction.followup.send(f"🚫 Banned {user.mention}.\n• Revoked {len(keys_to_ban)} keys.\n• Blacklisted {len(hwids_banned)} Unique HWIDs.")
         
@@ -625,16 +1908,23 @@ async def banuser(interaction: discord.Interaction, user: discord.Member, reason
 @bot.tree.command(name="lookup", description="Lookup key or user details (Admin Only)")
 @app_commands.describe(query="Key or Device Name to search for")
 async def lookup(interaction: discord.Interaction, query: str):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /lookup command received for query {query}")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer()
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
     
     try:
-        response = requests.post(f"{API_URL}/list", json={"admin_secret": ADMIN_SECRET})
-        if response.status_code == 200:
-            keys = response.json().get("keys", [])
+        status, data = db_query_fallback("/list", {"admin_secret": ADMIN_SECRET})
+        if status == 200:
+            keys = data.get("keys", [])
             # Search matches (Case-insensitive)
             query_lower = query.lower()
             matches = []
@@ -670,18 +1960,24 @@ async def lookup(interaction: discord.Interaction, query: str):
 @bot.tree.command(name="genkey", description="Generate license keys (Admin Only)")
 @app_commands.describe(amount="Number of keys to generate (default 1)", duration="Duration in hours (0 for lifetime)", note="Optional note for this batch")
 async def genkey(interaction: discord.Interaction, amount: int = 1, duration: int = 0, note: str = None):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /genkey command received")
+
+    try:
+        await interaction.response.defer() # Not ephemeral -> Visible to everyone in channel
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer() # Not ephemeral -> Visible to everyone in channel
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission to use this command.", ephemeral=True)
+        return
 
     try:
         payload = {"admin_secret": ADMIN_SECRET, "amount": amount, "duration_hours": duration, "note": note}
-        response = requests.post(f"{API_URL}/generate", json=payload)
+        status, data = db_query_fallback("/generate", payload)
         
-        if response.status_code == 200:
-            data = response.json()
+        if status == 200:
             keys = data.get("keys", [])
             count = data.get("count", 0)
 
@@ -714,45 +2010,58 @@ async def genkey(interaction: discord.Interaction, amount: int = 1, duration: in
                 await interaction.followup.send(embed=embed, file=discord_file)
 
         else:
-            await interaction.followup.send(f"❌ Error generating keys: {response.text}")
+            await interaction.followup.send(f"❌ Error generating keys: {data.get('error', 'Unknown Error')}")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to connect to key server: {e}")
 
 @bot.tree.command(name="managekeys", description="Open Key Management Dashboard (Admin Only)")
 async def managekeys(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /managekeys command received")
+
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer(ephemeral=True)
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission to use this command.", ephemeral=True)
+        return
 
     try:
         # Fetch keys
-        response = requests.post(f"{API_URL}/list", json={"admin_secret": ADMIN_SECRET})
-        if response.status_code == 200:
-            keys = response.json().get("keys", [])
+        status, data = db_query_fallback("/list", {"admin_secret": ADMIN_SECRET})
+        if status == 200:
+            keys = data.get("keys", [])
             user_map = await resolve_users_map(interaction, keys)
             view = KeyManagementView(keys, user_map)
             await interaction.followup.send(embed=view.main_embed, view=view)
         else:
-            await interaction.followup.send(f"❌ Error fetching keys: {response.text}")
+            await interaction.followup.send(f"❌ Error fetching keys: {data.get('error', 'Unknown Error')}")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to connect to key server: {e}")
 
 @bot.tree.command(name="keystatus", description="View key statistics (Admin Only)")
 async def keystatus(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("❌ You do not have permission to use this command.", ephemeral=True)
+    # DEBUG: Print to console
+    print(f"DEBUG: /keystatus command received")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
         return
 
-    await interaction.response.defer()
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission to use this command.", ephemeral=True)
+        return
 
     try:
         payload = {"admin_secret": ADMIN_SECRET}
-        response = requests.post(f"{API_URL}/stats", json=payload)
+        status, data = db_query_fallback("/stats", payload)
         
-        if response.status_code == 200:
-            data = response.json()
+        if status == 200:
             
             # Extract Data
             total = data.get("total", 0)
@@ -809,7 +2118,7 @@ async def keystatus(interaction: discord.Interaction):
             
             await interaction.followup.send(embed=embed)
         else:
-            await interaction.followup.send(f"❌ Error fetching stats: {response.text}")
+            await interaction.followup.send(f"❌ Error fetching stats: {data.get('error', 'Unknown Error')}")
 
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to connect to key server: {e}")
@@ -835,7 +2144,9 @@ async def help_command(interaction: discord.Interaction):
             "`/blacklist [action] [hwid]` - Manage HWID blacklist.\n"
             "`/keystatus` - View detailed system statistics.\n"
             "`/setrole [role]` - Set role to auto-assign on key claim.\n"
-            "`/setlog [channel]` - Set channel for real-time Webhook logs."
+            "`/setlog [channel]` - Set channel for real-time Webhook logs.\n"
+            "`/setwelcome [channel]` - Set channel for new member welcome messages.\n"
+            "`/pcredit [add|remove|set|balance]` - Manage PCredit system."
         ), inline=False)
     
     embed.set_footer(text="Pillow Player Authentication System")
@@ -857,19 +2168,359 @@ async def setrole(interaction: discord.Interaction, role: discord.Role):
 @bot.tree.command(name="setlog", description="Set the Audit Log channel (Admin Only)")
 @app_commands.describe(channel="The channel to send logs to")
 async def setlog(interaction: discord.Interaction, channel: discord.TextChannel):
+    # DEBUG: Print to console
+    print(f"DEBUG: /setlog command received")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    # Create Webhook
+    try:
+        webhook = await channel.create_webhook(name="Pillow Logger")
+
+        config = load_config()
+        config['log_channel_id'] = channel.id
+        config['webhook_url'] = webhook.url
+        save_config(config)
+        
+        await interaction.followup.send(f"✅ Audit Log channel set to {channel.mention}. Webhook created.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to create webhook: {e}")
+
+@bot.tree.command(name="setwelcome", description="Set the Welcome channel for new members (Admin Only)")
+@app_commands.describe(channel="The channel to send welcome messages to")
+async def setwelcome(interaction: discord.Interaction, channel: discord.TextChannel):
+    # DEBUG: Print to console
+    print(f"DEBUG: /setwelcome command received")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    try:
+        config = load_config()
+        config['welcome_channel_id'] = channel.id
+        save_config(config)
+        
+        await interaction.followup.send(f"✅ Welcome channel set to {channel.mention}. New members will be greeted here.")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to set welcome channel: {e}")
+
+# --- PCredit System ---
+pcredit_group = app_commands.Group(name="pcredit", description="Manage PCredit System")
+
+@pcredit_group.command(name="balance", description="Check credit balance")
+@app_commands.describe(user="The user to check (Defaults to yourself)")
+async def pcredit_balance(interaction: discord.Interaction, user: discord.Member = None):
+    # DEBUG: Print to console
+    print(f"DEBUG: /pcredit balance command received")
+
+    try:
+        await interaction.response.defer()
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    target_user = user or interaction.user
+    
+    # Check if admin if checking others
+    if user and user != interaction.user and not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You can only check your own balance.", ephemeral=True)
+        return
+
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET, # Needed for authentication with server
+            "discord_id": str(target_user.id)
+        }
+        
+        status, data = db_query_fallback("/pcredit/balance", payload)
+        
+        if status == 200:
+            balance = data.get("balance", 0)
+            
+            embed = discord.Embed(
+                title="💳 PCredit Balance",
+                description=f"Balance for {target_user.mention}",
+                color=discord.Color.gold()
+            )
+            embed.add_field(name="Current Balance", value=f"**{balance}** Credits", inline=False)
+            embed.set_thumbnail(url=target_user.display_avatar.url)
+            
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(f"❌ Error fetching balance: {data.get('error', 'Unknown Error')}")
+            
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to connect to server: {e}")
+
+@pcredit_group.command(name="add", description="Add credits to a user (Admin Only)")
+@app_commands.describe(user="The user to add credits to", amount="Amount to add")
+async def pcredit_add(interaction: discord.Interaction, user: discord.Member, amount: int):
+    print(f"DEBUG: /pcredit add command received")
+    try:
+        await interaction.response.defer()
+    except:
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+        
+    if amount <= 0:
+        await interaction.followup.send("❌ Amount must be positive.")
+        return
+
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET,
+            "action": "add",
+            "discord_id": str(user.id),
+            "amount": amount
+        }
+        status, data = db_query_fallback("/pcredit/manage", payload)
+        
+        if status == 200:
+            new_balance = data.get("new_balance")
+            await interaction.followup.send(f"✅ Added **{amount}** credits to {user.mention}. New Balance: **{new_balance}**")
+            
+            # Log it
+            try:
+                embed = discord.Embed(title="💳 PCredit Added", color=discord.Color.green())
+                embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
+                embed.add_field(name="User", value=user.mention, inline=True)
+                embed.add_field(name="Amount", value=str(amount), inline=True)
+                embed.add_field(name="New Balance", value=str(new_balance), inline=True)
+                await send_log_embed(interaction.guild, embed)
+            except:
+                pass
+        else:
+            await interaction.followup.send(f"❌ Error: {data.get('error', 'Unknown Error')}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Connection failed: {e}")
+
+@pcredit_group.command(name="remove", description="Remove credits from a user (Admin Only)")
+@app_commands.describe(user="The user to remove credits from", amount="Amount to remove")
+async def pcredit_remove(interaction: discord.Interaction, user: discord.Member, amount: int):
+    print(f"DEBUG: /pcredit remove command received")
+    try:
+        await interaction.response.defer()
+    except:
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if amount <= 0:
+        await interaction.followup.send("❌ Amount must be positive.")
+        return
+
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET,
+            "action": "remove",
+            "discord_id": str(user.id),
+            "amount": amount
+        }
+        status, data = db_query_fallback("/pcredit/manage", payload)
+        
+        if status == 200:
+            new_balance = data.get("new_balance")
+            await interaction.followup.send(f"✅ Removed **{amount}** credits from {user.mention}. New Balance: **{new_balance}**")
+            
+            try:
+                embed = discord.Embed(title="💳 PCredit Removed", color=discord.Color.red())
+                embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
+                embed.add_field(name="User", value=user.mention, inline=True)
+                embed.add_field(name="Amount", value=str(amount), inline=True)
+                embed.add_field(name="New Balance", value=str(new_balance), inline=True)
+                await send_log_embed(interaction.guild, embed)
+            except:
+                pass
+        else:
+            await interaction.followup.send(f"❌ Error: {data.get('error', 'Unknown Error')}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Connection failed: {e}")
+
+@pcredit_group.command(name="set", description="Set a user's credit balance (Admin Only)")
+@app_commands.describe(user="The user to set credits for", amount="New balance")
+async def pcredit_set(interaction: discord.Interaction, user: discord.Member, amount: int):
+    print(f"DEBUG: /pcredit set command received")
+    try:
+        await interaction.response.defer()
+    except:
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    if amount < 0:
+        await interaction.followup.send("❌ Amount cannot be negative.")
+        return
+
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET,
+            "action": "set",
+            "discord_id": str(user.id),
+            "amount": amount
+        }
+        status, data = db_query_fallback("/pcredit/manage", payload)
+        
+        if status == 200:
+            new_balance = data.get("new_balance")
+            await interaction.followup.send(f"✅ Set credits for {user.mention} to **{new_balance}**.")
+            
+            try:
+                embed = discord.Embed(title="💳 PCredit Set", color=discord.Color.orange())
+                embed.add_field(name="Admin", value=interaction.user.mention, inline=True)
+                embed.add_field(name="User", value=user.mention, inline=True)
+                embed.add_field(name="New Balance", value=str(new_balance), inline=True)
+                await send_log_embed(interaction.guild, embed)
+            except:
+                pass
+        else:
+            await interaction.followup.send(f"❌ Error: {data.get('error', 'Unknown Error')}")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Connection failed: {e}")
+
+@pcredit_group.command(name="buy", description="Redeem 20 PCredits for a License Key")
+async def pcredit_buy(interaction: discord.Interaction):
+    print(f"DEBUG: /pcredit buy command received")
+    
+    # ANTI-BOT CHECK
+    if interaction.user.bot:
+        await interaction.response.send_message("❌ Bots cannot buy keys.", ephemeral=True)
+        return
+
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except:
+        return
+
+    COST = 20
+    
+    # 1. Check Balance
+    try:
+        payload = {
+            "admin_secret": ADMIN_SECRET,
+            "discord_id": str(interaction.user.id)
+        }
+        status, data = db_query_fallback("/pcredit/balance", payload)
+        if status != 200:
+            await interaction.followup.send(f"❌ Error checking balance: {data.get('error')}", ephemeral=True)
+            return
+            
+        balance = data.get("balance", 0)
+        
+        if balance < COST:
+            await interaction.followup.send(f"❌ You need **{COST}** credits to buy a license. You have **{balance}**.", ephemeral=True)
+            return
+            
+        # 2. Deduct Credits
+        payload_deduct = {
+            "admin_secret": ADMIN_SECRET,
+            "action": "remove",
+            "discord_id": str(interaction.user.id),
+            "amount": COST
+        }
+        status_d, data_d = db_query_fallback("/pcredit/manage", payload_deduct)
+        
+        if status_d != 200:
+            await interaction.followup.send(f"❌ Transaction failed: {data_d.get('error')}", ephemeral=True)
+            return
+            
+        new_balance = data_d.get("new_balance")
+        
+        # 3. Generate Key
+        payload_gen = {
+            "admin_secret": ADMIN_SECRET,
+            "amount": 1,
+            "duration_hours": 0, # Lifetime
+            "note": f"Purchased with {COST} PCredits by {interaction.user.name}",
+            # "discord_id": str(interaction.user.id) # Do not pre-link
+        }
+        
+        status_g, data_g = db_query_fallback("/generate", payload_gen)
+        
+        if status_g == 200:
+            keys = data_g.get("keys", [])
+            if keys:
+                key = keys[0]
+                
+                # Log Purchase
+                try:
+                    log_embed = discord.Embed(title="🛒 Key Purchased", color=discord.Color.teal())
+                    log_embed.add_field(name="👤 User", value=interaction.user.mention, inline=True)
+                    log_embed.add_field(name="💰 Cost", value=f"**{COST}** Credits", inline=True)
+                    log_embed.add_field(name="🔢 Remaining", value=f"**{new_balance}** Credits", inline=True)
+                    log_embed.add_field(name="🔑 Key", value=f"`{key}`", inline=False)
+                    log_embed.set_footer(text="Pillow Player Store", icon_url=interaction.user.display_avatar.url)
+                    log_embed.timestamp = datetime.datetime.now()
+                    await send_log_embed(interaction.guild, log_embed)
+                except: pass
+
+                # Try DM
+                try:
+                    embed = discord.Embed(title="🎉 Purchase Successful!", color=discord.Color.gold())
+                    embed.description = f"You have redeemed **{COST}** credits for a license."
+                    embed.add_field(name="Your License Key", value=f"```{key}```", inline=False)
+                    embed.add_field(name="Instructions", value="Use `/claim` in the server to activate this key.", inline=False)
+                    embed.set_footer(text="Thank you for your support!")
+                    await interaction.user.send(embed=embed)
+                    await interaction.followup.send(f"✅ **Purchase Successful!** I have sent the key to your DMs.\nNew Balance: **{new_balance}**", ephemeral=True)
+                except discord.Forbidden:
+                    await interaction.followup.send(f"✅ **Purchase Successful!**\n\n**Key:** `{key}`\n\n⚠️ I couldn't DM you, so here it is. Save it immediately!\nNew Balance: **{new_balance}**", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Purchase failed: {e}", ephemeral=True)
+
+@bot.tree.command(name="postredeem", description="Post the Redeem License Panel (Admin Only)")
+async def postredeem(interaction: discord.Interaction, channel: discord.TextChannel = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
         return
 
-    # Create Webhook
-    webhook = await channel.create_webhook(name="Pillow Logger")
-
-    config = load_config()
-    config['log_channel_id'] = channel.id
-    config['webhook_url'] = webhook.url
-    save_config(config)
+    target_channel = channel or interaction.channel
     
-    await interaction.response.send_message(f"✅ Audit Log channel set to {channel.mention}. Webhook created.")
+    embed = discord.Embed(
+        title="🛒 Pillow Player Store",
+        description="Redeem your **PCredits** for a Lifetime License Key instantly!",
+        color=discord.Color.green()
+    )
+    embed.add_field(name="💰 Price", value="**20 Credits** = 1 License Key", inline=False)
+    embed.add_field(name="❓ How to earn credits?", value="Invite your friends! **1 Invite = 1 Credit**", inline=False)
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2331/2331970.png")
+    embed.set_footer(text="Click the button below to buy now.")
+    
+    await target_channel.send(embed=embed, view=RedeemSystemView())
+    await interaction.response.send_message(f"✅ Redeem panel posted to {target_channel.mention}", ephemeral=True)
+
+bot.tree.add_command(pcredit_group)
+
+# Helper for logging embeds
+async def send_log_embed(guild, embed):
+    config = load_config()
+    channel_id = config.get('log_channel_id')
+    if channel_id:
+        channel = guild.get_channel(channel_id)
+        if channel:
+            embed.timestamp = datetime.datetime.now()
+            await channel.send(embed=embed)
 
 async def send_log(guild, title, description, color=discord.Color.blue()):
     config = load_config()
