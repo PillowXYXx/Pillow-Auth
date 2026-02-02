@@ -1,6 +1,7 @@
 import threading
 import time
 import os
+import requests
 import server
 import bot
 
@@ -12,6 +13,18 @@ def run_server():
     port = int(os.environ.get("PORT", 5000))
     # Run Flask (blocking)
     server.app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+# 2. Keep-Alive Pinger
+def keep_alive_pinger():
+    """Pings the server every 5 minutes to prevent idle sleep."""
+    url = "https://pillow-auth.onrender.com/"
+    print(f"[KeepAlive] Started pinger for {url}")
+    while True:
+        time.sleep(200) # 3 minutes 20 seconds (safe margin)
+        try:
+            requests.get(url, timeout=10)
+        except Exception as e:
+            print(f"[KeepAlive] Ping failed: {e}")
 
 if __name__ == "__main__":
     print("---------------------------------------------------")
