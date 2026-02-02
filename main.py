@@ -37,9 +37,9 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"CRITICAL ERROR: Bot failed to start: {e}")
         print("POSSIBLE FIXES:")
-        print("1. Check if DISCORD_TOKEN is correct.")
-        print("2. Enable 'Server Members Intent' & 'Message Content Intent' in Discord Developer Portal.")
-        print("3. Check if 'privledged intents' are enabled for the bot.")
+        print("1. CHECK YOUR TOKEN: Discord reset it because it was leaked. Generate a new one!")
+        print("2. Set the NEW token in Render Environment Variables (Key: DISCORD_TOKEN).")
+        print("3. Do NOT paste the token in the code.")
         print("[System] Keeping Web Server alive despite Bot failure...")
         
         # Keep the process alive so Render doesn't 502 (and we can see logs)
