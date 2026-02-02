@@ -22,10 +22,26 @@ if __name__ == "__main__":
     server_thread = threading.Thread(target=run_server, daemon=True)
     server_thread.start()
     
+    # Start Keep-Alive Thread
+    keep_alive_thread = threading.Thread(target=keep_alive_pinger, daemon=True)
+    keep_alive_thread.start()
+    
     print("[System] API Server started on port 5000.")
     print("[System] Waiting 3 seconds for server to initialize...")
     time.sleep(3)
     
     print("[System] Starting Discord Bot...")
     # Start Bot (Main Thread)
-    bot.bot.run(bot.BOT_TOKEN)
+    try:
+        bot.bot.run(bot.BOT_TOKEN)
+    except Exception as e:
+        print(f"CRITICAL ERROR: Bot failed to start: {e}")
+        print("POSSIBLE FIXES:")
+        print("1. Check if DISCORD_TOKEN is correct.")
+        print("2. Enable 'Server Members Intent' & 'Message Content Intent' in Discord Developer Portal.")
+        print("3. Check if 'privledged intents' are enabled for the bot.")
+        print("[System] Keeping Web Server alive despite Bot failure...")
+        
+        # Keep the process alive so Render doesn't 502 (and we can see logs)
+        while True:
+            time.sleep(60)

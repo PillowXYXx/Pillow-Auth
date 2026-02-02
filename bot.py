@@ -17,7 +17,9 @@ from user_utils import resolve_users_map
 # Token should be set in Environment Variables
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 if not BOT_TOKEN:
-    print("⚠️ ERROR: DISCORD_TOKEN environment variable not set!")
+    # Fallback for easier deployment
+    BOT_TOKEN = "MTQ2NjQ3MDA0OTA4MTU5MzkxMQ.GVDRcS.NQA3_6Iy56LpxlJdpIAj8chcJwBT-qXir1Mb_U"
+    print("⚠️ WARNING: Using hardcoded fallback token. Please set DISCORD_TOKEN env var for security.")
 # Use Public URL for Cloud, Localhost for testing
 # If we find a "RENDER_EXTERNAL_URL" environment variable, we use that.
 if os.environ.get("RENDER"):
