@@ -88,6 +88,10 @@ def init_db():
     conn.commit()
     conn.close()
 
+@app.route('/')
+def home():
+    return "I am alive!", 200
+
 @app.route('/verify', methods=['POST'])
 def verify_key():
     data = request.json
