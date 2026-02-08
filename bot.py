@@ -2541,6 +2541,7 @@ async def help_command(interaction: discord.Interaction):
                 "`/keystatus` - View detailed system statistics.\n"
                 "`/setrole [role]` - Set role to auto-assign on key claim.\n"
                 "`/setlog [channel]` - Set channel for real-time Webhook logs.\n"
+                "`/set_review_channel [channel]` - Set channel for reviews.\n"
                 "`/setwelcome [channel]` - Set channel for new member welcome messages.\n"
                 "`/pcredit [add|remove|set|balance]` - Manage PCredit system."
             ), inline=False)
@@ -2591,6 +2592,24 @@ async def setlog(interaction: discord.Interaction, channel: discord.TextChannel)
         await interaction.followup.send(f"✅ Audit Log channel set to {channel.mention}. Webhook created.")
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to create webhook: {e}")
+
+@bot.tree.command(name="set_review_channel", description="Set the channel where reviews will be posted (Admin Only)")
+@app_commands.describe(channel="The channel to post reviews in")
+async def set_review_channel(interaction: discord.Interaction, channel: discord.TextChannel):
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except:
+        pass
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    config = load_config()
+    config['review_channel_id'] = channel.id
+    save_config(config)
+    
+    await interaction.followup.send(f"✅ Review channel set to {channel.mention}")
 
 @bot.tree.command(name="setwelcome", description="Set the Welcome channel for new members (Admin Only)")
 @app_commands.describe(channel="The channel to send welcome messages to")
