@@ -164,8 +164,8 @@ def verify_key():
             {"name": "🔢 Total Accounts", "value": f"{total_keys}", "inline": True}
         ]
         send_discord_webhook("🟢 New Activation", f"Key activated by {user_str}", 65280, fields) # Green
-
-        return jsonify({"valid": True, "message": "Key Activated Successfully!"})
+        
+        return jsonify({"valid": True, "message": "Key Activated Successfully!", "discord_id": discord_id})
 
     elif status == "used":
         if stored_hwid == hwid:
@@ -185,8 +185,8 @@ def verify_key():
                 {"name": "🔢 Total Accounts", "value": f"{total_keys}", "inline": True}
             ]
             send_discord_webhook("🔵 Session Started", f"User {user_str} launched the software.", 3447003, fields) # Blue
-
-            return jsonify({"valid": True, "message": "Welcome back!"})
+        
+            return jsonify({"valid": True, "message": "Welcome back!", "discord_id": discord_id})
         else:
             conn.close()
             
