@@ -662,6 +662,61 @@ async def postsetup(interaction: discord.Interaction, channel: discord.TextChann
     except Exception as e:
         await interaction.followup.send(f"❌ Failed to post: {e}")
 
+@bot.tree.command(name="postrejoin", description="Post an explanation of the Pillow ReJoin monitor (Admin Only)")
+async def postrejoin(interaction: discord.Interaction, channel: discord.TextChannel = None):
+    print("DEBUG: /postrejoin command received!")
+    
+    try:
+        await interaction.response.defer(ephemeral=True)
+    except Exception as e:
+        print(f"DEBUG: Defer failed: {e}")
+        return
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send("❌ You do not have permission.", ephemeral=True)
+        return
+
+    target_channel = channel or interaction.channel
+
+    embed = discord.Embed(
+        title="🧠 Pillow ReJoin – Auto Rejoin & DM Control Panel",
+        description=(
+            "**What it does**\n"
+            "Pillow ReJoin keeps your Roblox accounts online by automatically detecting disconnects and relaunching them.\n"
+            "It also gives you a Discord **DM Control Panel** to manage every instance.\n\n"
+            "**How to use it**\n"
+            "1. Run the latest Pillow Player client.\n"
+            "2. After login, you will receive a DM from the Pillow ReJoin bot.\n"
+            "3. Use the DM panel to:\n"
+            "   • View which accounts are running\n"
+            "   • Relaunch stuck/offline accounts\n"
+            "   • Kill all Roblox instances\n"
+            "   • Request a desktop screenshot\n\n"
+            "**Notes**\n"
+            "• Auto‑rejoin is fully automatic; the panel is optional.\n"
+            "• Keep Pillow Player open on your host PC for the bot to stay online."
+        ),
+        color=discord.Color.blurple()
+    )
+
+    banner_path = os.path.join(os.getcwd(), "banner.png")
+    file = None
+    if os.path.exists(banner_path):
+        try:
+            file = discord.File(banner_path, filename="banner.png")
+            embed.set_image(url="attachment://banner.png")
+        except Exception as e:
+            print(f"Failed to attach banner.png: {e}")
+
+    try:
+        if file:
+            await target_channel.send(embed=embed, file=file)
+        else:
+            await target_channel.send(embed=embed)
+        await interaction.followup.send(f"✅ ReJoin info posted to {target_channel.mention}", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}", ephemeral=True)
+
 @bot.tree.command(name="postpurchase", description="Post the Purchase Panel (Admin Only)")
 async def postpurchase(interaction: discord.Interaction, channel: discord.TextChannel = None):
     # DEBUG: Print to console to verify command is hit
