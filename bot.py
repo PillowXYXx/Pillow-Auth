@@ -699,7 +699,8 @@ async def postrejoin(interaction: discord.Interaction, channel: discord.TextChan
         color=discord.Color.blurple()
     )
 
-    banner_path = os.path.join(os.getcwd(), "banner.png")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    banner_path = os.path.join(base_dir, "banner.png")
     file = None
     if os.path.exists(banner_path):
         try:
