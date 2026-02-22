@@ -7,6 +7,7 @@ import requests
 import json
 import io
 import datetime
+import time
 import os
 import sqlite3
 import uuid
@@ -505,6 +506,104 @@ async def review(interaction: discord.Interaction, rating: app_commands.Range[in
     except Exception as e:
         await interaction.followup.send(f"❌ Error: {e}", ephemeral=True)
 
+user_reset_last = {}
+
+@bot.tree.command(name="mykeys", description="View your keys")
+async def mykeys(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    payload = {"discord_id": str(interaction.user.id), "admin_secret": ADMIN_SECRET}
+    status, data = await db_query_fallback("/get_user_keys", payload)
+    keys = data.get("keys", [])
+    embed = discord.Embed(title="Your Keys", color=discord.Color.blurple())
+    if not keys:
+        embed.description = "No keys linked."
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    lines = []
+    if isinstance(keys[0], dict):
+        for k in keys[:20]:
+            code = k.get("key_code") or k.get("key") or "Unknown"
+            st = k.get("status", "unknown")
+            exp = k.get("expires_at", "")
+            line = f"• {code} — {st}" + (f" (exp: {exp})" if exp else "")
+            lines.append(line)
+    else:
+        for code in keys[:20]:
+            lines.append(f"• {code}")
+    embed.description = "\n".join(lines)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="status", description="Show your license status")
+async def status_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    payload = {"discord_id": str(interaction.user.id), "admin_secret": ADMIN_SECRET}
+    status, data = await db_query_fallback("/get_user_keys", payload)
+    keys = data.get("keys", [])
+    total = len(keys)
+    active = 0
+    unused = 0
+    expired = 0
+    if keys and isinstance(keys[0], dict):
+        for k in keys:
+            s = (k.get("status") or "").lower()
+            if s in ["active", "used"]:
+                active += 1
+            elif s == "unused":
+                unused += 1
+            elif s == "expired":
+                expired += 1
+    embed = discord.Embed(title="License Status", color=discord.Color.green())
+    if total == 0:
+        embed.description = "No keys linked."
+    else:
+        embed.add_field(name="Total", value=str(total), inline=True)
+        if active or unused or expired:
+            embed.add_field(name="Active", value=str(active), inline=True)
+            embed.add_field(name="Unused", value=str(unused), inline=True)
+            embed.add_field(name="Expired", value=str(expired), inline=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="reset_hwid", description="Reset HWID for your key")
+@app_commands.describe(key="Your key code (required if multiple linked)")
+async def reset_hwid(interaction: discord.Interaction, key: str = None):
+    await interaction.response.defer(ephemeral=True)
+    uid = str(interaction.user.id)
+    now = int(time.time())
+    last = user_reset_last.get(uid, 0)
+    if now - last < 3600:
+        remain = 3600 - (now - last)
+        await interaction.followup.send(f"Please wait {remain//60}m before requesting another reset.", ephemeral=True)
+        return
+    payload = {"discord_id": uid, "admin_secret": ADMIN_SECRET}
+    status, data = await db_query_fallback("/get_user_keys", payload)
+    keys = data.get("keys", [])
+    owned = []
+    if keys:
+        if isinstance(keys[0], dict):
+            owned = [k.get("key_code") or k.get("key") for k in keys if (k.get("key_code") or k.get("key"))]
+        else:
+            owned = keys
+    if not owned:
+        await interaction.followup.send("No keys linked.", ephemeral=True)
+        return
+    target = key
+    if not target:
+        if len(owned) == 1:
+            target = owned[0]
+        else:
+            lines = "\n".join([f"• {k}" for k in owned[:20]])
+            await interaction.followup.send(f"Multiple keys linked. Specify one:\n{lines}", ephemeral=True)
+            return
+    if target not in owned:
+        await interaction.followup.send("That key is not linked to your account.", ephemeral=True)
+        return
+    rstatus, rdata = await db_query_fallback("/reset_batch", {"admin_secret": ADMIN_SECRET, "keys": [target]})
+    if rstatus == 200:
+        user_reset_last[uid] = now
+        await interaction.followup.send(f"HWID reset for {target}.", ephemeral=True)
+    else:
+        msg = rdata.get("error") or "Reset failed."
+        await interaction.followup.send(msg, ephemeral=True)
 @bot.tree.command(name="postrules", description="Post the official Server Rules (Admin Only)")
 async def postrules(interaction: discord.Interaction, channel: discord.TextChannel = None):
     # DEBUG: Print to console to verify command is hit
