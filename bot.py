@@ -15,10 +15,10 @@ import secrets
 from user_utils import resolve_users_map
 
 # CONFIGURATION
-# Token should be set in Environment Variables
+# Token must be provided via environment variable DISCORD_TOKEN (no token in code)
 BOT_TOKEN = os.environ.get("DISCORD_TOKEN")
 if not BOT_TOKEN:
-    print("⚠️ ERROR: DISCORD_TOKEN environment variable not set! Bot cannot start.")
+    raise RuntimeError("DISCORD_TOKEN environment variable not set; bot cannot start.")
 # Use Public URL for Cloud, Localhost for testing
 # If we find a "RENDER_EXTERNAL_URL" environment variable, we use that.
 if os.environ.get("RENDER"):
