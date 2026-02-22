@@ -10,9 +10,10 @@ from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
 DB_FILE = "keys.db"
-ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD"  # Used by the bot to generate keys
+ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD"
 CONFIG_FILE = "bot_config.json"
 DISCORD_API_BASE = "https://discord.com/api"
+link_sessions = {}
 
 def load_config():
     try:
@@ -360,7 +361,11 @@ def discord_auth_start():
     client_id, client_secret, redirect_uri = get_discord_oauth_config()
     if not client_id or not redirect_uri:
         return "Discord OAuth not configured", 500
-    state_raw = secrets.token_hex(16)
+    session_id = request.args.get("session_id", "")
+    if session_id:
+        state_raw = session_id
+    else:
+        state_raw = secrets.token_hex(16)
     state = base64.urlsafe_b64encode(state_raw.encode()).decode().rstrip("=")
     params = {
         "client_id": client_id,
@@ -422,7 +427,28 @@ def discord_auth_callback():
         "global_name": user_info.get("global_name"),
         "keys": keys
     }
-    return jsonify(result)
+    state_param = request.args.get("state", "")
+    session_id = ""
+    if state_param:
+        try:
+            padding = "=" * (-len(state_param) % 4)
+            decoded = base64.urlsafe_b64decode((state_param + padding).encode())
+            session_id = decoded.decode()
+        except Exception:
+            session_id = ""
+    if session_id:
+        link_sessions[session_id] = {"data": result}
+    return "<html><body><h2>Discord linked</h2><p>You can close this tab and return to Pillow Rejoin.</p></body></html>"
+
+@app.route('/auth/discord/status')
+def discord_auth_status():
+    session_id = request.args.get("session_id", "")
+    if not session_id:
+        return jsonify({"done": False}), 400
+    entry = link_sessions.get(session_id)
+    if not entry:
+        return jsonify({"done": False})
+    return jsonify({"done": True, "data": entry.get("data")})
 
 @app.route('/stats', methods=['POST'])
 def get_stats():
