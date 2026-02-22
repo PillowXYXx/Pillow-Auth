@@ -3,13 +3,16 @@ import uuid
 import secrets
 import datetime
 import json
+import os
+import base64
 import requests
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
 DB_FILE = "keys.db"
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD"  # Used by the bot to generate keys
 CONFIG_FILE = "bot_config.json"
+DISCORD_API_BASE = "https://discord.com/api"
 
 def load_config():
     try:
@@ -17,6 +20,13 @@ def load_config():
             return json.load(f)
     except FileNotFoundError:
         return {}
+
+def get_discord_oauth_config():
+    cfg = load_config()
+    client_id = os.environ.get("DISCORD_CLIENT_ID") or cfg.get("discord_client_id")
+    client_secret = os.environ.get("DISCORD_CLIENT_SECRET") or cfg.get("discord_client_secret")
+    redirect_uri = os.environ.get("DISCORD_REDIRECT_URI") or cfg.get("discord_redirect_uri")
+    return client_id, client_secret, redirect_uri
 
 def send_discord_webhook(title, description, color, fields=None):
     config = load_config()
@@ -344,6 +354,75 @@ def get_user_keys():
     conn.close()
     
     return jsonify({"keys": keys})
+
+@app.route('/auth/discord/start')
+def discord_auth_start():
+    client_id, client_secret, redirect_uri = get_discord_oauth_config()
+    if not client_id or not redirect_uri:
+        return "Discord OAuth not configured", 500
+    state_raw = secrets.token_hex(16)
+    state = base64.urlsafe_b64encode(state_raw.encode()).decode().rstrip("=")
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "scope": "identify",
+        "redirect_uri": redirect_uri,
+        "state": state,
+        "prompt": "consent"
+    }
+    query = "&".join(f"{k}={requests.utils.quote(str(v))}" for k, v in params.items())
+    url = f"https://discord.com/api/oauth2/authorize?{query}"
+    return redirect(url)
+
+@app.route('/auth/discord/callback')
+def discord_auth_callback():
+    code = request.args.get("code")
+    if not code:
+        return "Missing code", 400
+    client_id, client_secret, redirect_uri = get_discord_oauth_config()
+    if not client_id or not client_secret or not redirect_uri:
+        return "Discord OAuth not configured", 500
+    data = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri
+    }
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    token_resp = requests.post(f"{DISCORD_API_BASE}/oauth2/token", data=data, headers=headers)
+    if token_resp.status_code != 200:
+        return "Failed to fetch token", 400
+    token_json = token_resp.json()
+    access_token = token_json.get("access_token")
+    if not access_token:
+        return "No access token", 400
+    user_headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    user_resp = requests.get(f"{DISCORD_API_BASE}/users/@me", headers=user_headers)
+    if user_resp.status_code != 200:
+        return "Failed to fetch user", 400
+    user_info = user_resp.json()
+    discord_id = str(user_info.get("id"))
+    if not discord_id:
+        return "Missing user id", 400
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM licenses WHERE discord_id=?", (discord_id,))
+    rows = c.fetchall()
+    keys = [dict(row) for row in rows]
+    conn.close()
+    result = {
+        "discord_id": discord_id,
+        "username": user_info.get("username"),
+        "global_name": user_info.get("global_name"),
+        "keys": keys
+    }
+    return jsonify(result)
 
 @app.route('/stats', methods=['POST'])
 def get_stats():
