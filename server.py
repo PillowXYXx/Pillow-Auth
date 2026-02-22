@@ -414,6 +414,11 @@ def discord_auth_callback():
     discord_id = str(user_info.get("id"))
     if not discord_id:
         return "Missing user id", 400
+    avatar_hash = user_info.get("avatar")
+    if avatar_hash:
+        avatar_url = f"https://cdn.discordapp.com/avatars/{discord_id}/{avatar_hash}.png?size=64"
+    else:
+        avatar_url = None
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     c = conn.cursor()
@@ -425,6 +430,7 @@ def discord_auth_callback():
         "discord_id": discord_id,
         "username": user_info.get("username"),
         "global_name": user_info.get("global_name"),
+        "avatar_url": avatar_url,
         "keys": keys
     }
     state_param = request.args.get("state", "")
