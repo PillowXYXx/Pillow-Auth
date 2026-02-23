@@ -30,7 +30,8 @@ else:
 SERVER_URL = API_URL
 
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD" # Must match server.py
-CONFIG_FILE = "bot_config.json"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.normpath(os.environ.get("BOT_CONFIG_PATH") or os.path.join(_BASE_DIR, "..", "bot_config.json"))
 DB_FILE = os.path.join(os.path.dirname(__file__), "keys.db")
 ticket_lock = set()
 
@@ -1905,6 +1906,7 @@ class RedeemSystemView(View):
                 "amount": 1,
                 "duration_hours": 0, # Lifetime
                 "note": f"Purchased with {COST} PCredits by {interaction.user.name}",
+                "discord_id": str(interaction.user.id)
             }
             
             status_g, data_g = await db_query_fallback("/generate", payload_gen)
@@ -1913,6 +1915,15 @@ class RedeemSystemView(View):
                 keys = data_g.get("keys", [])
                 if keys:
                     key = keys[0]
+                    
+                    try:
+                        await db_query_fallback("/link_discord", {
+                            "admin_secret": ADMIN_SECRET,
+                            "key": key,
+                            "discord_id": str(interaction.user.id)
+                        })
+                    except:
+                        pass
                     
                     # Log Purchase
                     try:

@@ -9,9 +9,10 @@ import requests
 from flask import Flask, request, jsonify, redirect
 
 app = Flask(__name__)
-DB_FILE = "keys.db"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(_BASE_DIR, "keys.db")
 ADMIN_SECRET = "CHANGE_THIS_TO_A_SECRET_PASSWORD"
-CONFIG_FILE = "bot_config.json"
+CONFIG_FILE = os.path.normpath(os.environ.get("BOT_CONFIG_PATH") or os.path.join(_BASE_DIR, "..", "bot_config.json"))
 DISCORD_API_BASE = "https://discord.com/api"
 link_sessions = {}
 
