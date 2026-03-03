@@ -1,5 +1,6 @@
 {
     "customer_role_id": 1458598736396816546,
-    "review_channel_id": 1466534701392072888,
-    "log_channel_id": 1466534701392072888
+    "review_channel_id": 1468265573694837003,
+    "log_channel_id": "ENTER_LOG_CHANNEL_ID",
+    "welcome_channel_id": 1478497158402670714
 }

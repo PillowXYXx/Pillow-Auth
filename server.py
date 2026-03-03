@@ -148,11 +148,11 @@ def verify_key():
         total_keys = c.fetchone()[0]
 
     # Check expiration if active
-    if expires_at:
-        expiry_dt = datetime.datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S.%f') if '.' in expires_at else datetime.datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S')
-        if datetime.datetime.now() > expiry_dt:
-            conn.close()
-            return jsonify({"valid": False, "message": "Key Expired"}), 403
+    # if expires_at:
+    #     expiry_dt = datetime.datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S.%f') if '.' in expires_at else datetime.datetime.strptime(expires_at, '%Y-%m-%d %H:%M:%S')
+    #     if datetime.datetime.now() > expiry_dt:
+    #         conn.close()
+    #         return jsonify({"valid": False, "message": "Key Expired"}), 403
 
     if status == "unused":
         # First activation
